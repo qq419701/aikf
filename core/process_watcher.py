@@ -67,7 +67,7 @@ PLATFORM_NAMES = {
 }
 
 
-dataclass
+@dataclass
 class NetworkConn:
     """网络连接信息"""
     local_ip: str = ''
@@ -78,7 +78,7 @@ class NetworkConn:
     is_ws_candidate: bool = False  # 远端 443/80/8080 的 ESTABLISHED 连接
 
 
-dataclass
+@dataclass
 class ShopProcess:
     """店铺进程信息（完整字段）"""
     pid: int = 0
