@@ -167,67 +167,130 @@ def _extract_shop_name(titles: list) -> str:
 
 
 def _get_local_data_dirs(proc_name: str) -> list:
-    """获取应用本地数据目录"""
+    """获取应用本地数据目录（含公共目录和用户目录）"""
     dirs = []
-    app_names = [
-        proc_name,
-        proc_name.replace('.exe', ''),
-        '拼多多商家版',
-        'pddmerchant',
-        'jdmerchant',
-        'PddWorkbench',
-        'pinduoduo',
-    ]
-    base_dirs = []
+
+    # ── Windows 搜索路径 ──
     if sys.platform == 'win32':
-        appdata = os.environ.get('APPDATA', '')
+        # 1. C:\Users\Public\Documents\PDD  （拼多多工作台实际写入位置）
+        public_docs = os.path.join(os.environ.get('PUBLIC', r'C:\Users\Public'), 'Documents')
+        pdd_public_candidates = [
+            os.path.join(public_docs, 'PDD'),
+            os.path.join(public_docs, 'PDDData'),
+            os.path.join(public_docs, 'PinDuoDuo'),
+        ]
+        for p in pdd_public_candidates:
+            if os.path.isdir(p):
+                dirs.append(p)
+
+        # 2. 用户目录下常见子目录
+        appdata      = os.environ.get('APPDATA', '')
         localappdata = os.environ.get('LOCALAPPDATA', '')
+        userprofile  = os.environ.get('USERPROFILE', '')
+
+        app_names = [
+            proc_name,
+            proc_name.replace('.exe', ''),
+            'PDD',
+            'PDDData',
+            'PddWorkbench',
+            'pddworkbench',
+            'pinduoduo',
+            'PinDuoDuo',
+            'pddmerchant',
+            'jdmerchant',
+            '拼多多',
+            '拼多多商家版',
+        ]
+
+        base_dirs = []
         if appdata:
             base_dirs.append(appdata)
         if localappdata:
             base_dirs.append(localappdata)
+        if userprofile:
+            base_dirs.append(os.path.join(userprofile, 'AppData', 'Roaming'))
+            base_dirs.append(os.path.join(userprofile, 'AppData', 'Local'))
+            base_dirs.append(os.path.join(userprofile, 'Documents'))
+
+        for base in base_dirs:
+            for name in app_names:
+                candidate = os.path.join(base, name)
+                if os.path.isdir(candidate):
+                    dirs.append(candidate)
+
+        # 3. 枚举所有用户目录下的 PDD 文件夹（支持多用户场景）
+        try:
+            users_root = os.path.join(os.environ.get('SystemDrive', 'C:'), 'Users')
+            for username in os.listdir(users_root):
+                user_path = os.path.join(users_root, username)
+                if not os.path.isdir(user_path):
+                    continue
+                for sub in ['AppData\\Local\\PDD', 'AppData\\Roaming\\PDD',
+                            'AppData\\Local\\PddWorkbench', 'AppData\\Roaming\\PddWorkbench',
+                            'Documents\\PDD']:
+                    p = os.path.join(user_path, sub)
+                    if os.path.isdir(p):
+                        dirs.append(p)
+        except Exception:
+            pass
+
     else:
+        # Linux / macOS
         home = os.path.expanduser('~')
-        base_dirs.extend([
+        app_names = [
+            proc_name,
+            proc_name.replace('.exe', ''),
+            'pddmerchant',
+            'jdmerchant',
+            'PddWorkbench',
+            'pinduoduo',
+        ]
+        base_dirs = [
             os.path.join(home, '.config'),
             os.path.join(home, '.local', 'share'),
-        ])
+        ]
+        for base in base_dirs:
+            for name in app_names:
+                candidate = os.path.join(base, name)
+                if os.path.isdir(candidate):
+                    dirs.append(candidate)
 
-    for base in base_dirs:
-        for name in app_names:
-            candidate = os.path.join(base, name)
-            if os.path.isdir(candidate):
-                dirs.append(candidate)
-    return list(set(dirs))
+    return list(dict.fromkeys(dirs))  # 去重保序
 
 
 def _scan_data_files(data_dirs: list) -> dict:
-    """在数据目录中扫描关键文件"""
+    """在数据目录中扫描���键文件"""
     result = {
         'cookies_files': [],
         'local_storage_dirs': [],
         'indexeddb_dirs': [],
         'json_configs': [],
+        'db_files': [],
     }
     for d in data_dirs:
         try:
             for root, dirs, files in os.walk(d, followlinks=False):
                 # 跳过太深的目录
                 depth = root.replace(d, '').count(os.sep)
-                if depth > 5:
+                if depth > 6:
                     dirs.clear()
                     continue
                 for fname in files:
                     fpath = os.path.join(root, fname)
-                    if fname.lower() == 'cookies':
+                    fname_lower = fname.lower()
+                    if fname_lower == 'cookies':
                         result['cookies_files'].append(fpath)
-                    elif fname.lower().endswith('.json'):
+                    elif fname_lower.endswith('.json'):
                         result['json_configs'].append(fpath)
+                    elif fname_lower.endswith('.db') or fname_lower.endswith('.sqlite'):
+                        result['db_files'].append(fpath)
                 for dname in dirs:
                     dpath = os.path.join(root, dname)
-                    if dname.lower() == 'local storage':
+                    dname_lower = dname.lower()
+                    if dname_lower == 'local storage':
                         result['local_storage_dirs'].append(dpath)
-                    elif dname.lower() == 'indexeddb':
+                    elif dname_lower == 'indexeddb':
                         result['indexeddb_dirs'].append(dpath)
         except Exception:
             pass
@@ -294,7 +357,7 @@ def _collect_process_info(proc: psutil.Process) -> ShopProcess:
 
     # 打开的文件（过滤含敏感关键词的路径）
     try:
-        sensitive_kws = ['token', 'cookie', 'session', 'auth', 'user', 'login', 'key']
+        sensitive_kws = ['token', 'cookie', 'session', 'auth', 'user', 'login', 'key', 'pdd', 'wbchat']
         open_files = proc.open_files()
         for f in open_files:
             try:
@@ -565,13 +628,15 @@ class ProcessWatcher(QObject):
             'env_relevant_keys': list(sp.env_relevant.keys()),
         }
 
-        # 深度扫描数据目录（文件大小、IndexedDB 文件数量）
+        # 深度扫描数据目录
         detail_data_files = {}
         try:
             if sp.local_data_dirs:
                 sp.data_files = _scan_data_files(sp.local_data_dirs)
                 detail_data_files['cookies_count'] = len(sp.data_files.get('cookies_files', []))
                 detail_data_files['json_count'] = len(sp.data_files.get('json_configs', []))
+                detail_data_files['db_files'] = sp.data_files.get('db_files', [])
+                detail_data_files['db_count'] = len(detail_data_files['db_files'])
                 detail_data_files['local_storage'] = bool(sp.data_files.get('local_storage_dirs', []))
                 detail_data_files['indexeddb'] = bool(sp.data_files.get('indexeddb_dirs', []))
                 # 统计 IndexedDB 文件数量
