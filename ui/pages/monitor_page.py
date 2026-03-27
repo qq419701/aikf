@@ -180,7 +180,7 @@ class MonitorPage(QWidget):
         left_layout.addWidget(self._status_label)
 
         # 进程卡片滚动区
-        scroll = QScrollArea()
+        scroll = QScrollArea() 
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -207,7 +207,7 @@ class MonitorPage(QWidget):
         right_layout.setSpacing(8)
 
         # 右侧滚动区
-        right_scroll = QScrollArea()
+        right_scroll = QScrollArea() 
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QFrame.Shape.NoFrame)
 
@@ -254,7 +254,7 @@ class MonitorPage(QWidget):
         self._watcher.scan_completed.connect(self._on_scan_completed)
 
     def _on_process_found(self, sp: ShopProcess):
-        """添加新进程卡片"""
+        """添加新进程卡片""" 
         card = ProcessCard(sp)
         card.clicked.connect(self._on_card_clicked)
         self._cards[sp.pid] = card
@@ -392,7 +392,7 @@ class MonitorPage(QWidget):
         self._detail_layout.addLayout(row('路径', getattr(sp, 'exe_path', '') or '未知'))
         self._detail_layout.addLayout(row('内存', f"{getattr(sp, 'memory_mb', 0.0):.1f} MB"))
         self._detail_layout.addLayout(row('CPU', f"{getattr(sp, 'cpu_percent', 0.0):.1f}%"))
-        self._detail_layout.addLayout(row('启动时间', getattr(sp, 'create_time_str', ''))))
+        self._detail_layout.addLayout(row('启动时间', getattr(sp, 'create_time_str', '')))
         self._detail_layout.addLayout(row('运行时长', f'{h}h {m}m {s}s'))
 
         # ── 店铺信息 ──
