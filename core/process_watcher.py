@@ -16,6 +16,14 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 # 已知进程名称映射
 KNOWN_PROCESSES = {
+    # 拼多多 - 新版工作台（实测进程名）
+    'PddWorkbench.exe': 'pdd',
+    'pddworkbench.exe': 'pdd',
+    'pddwebworkbench.exe': 'pdd',
+    'PddService.exe': 'pdd',
+    'PddCoreService.exe': 'pdd',
+    'PDDWBGd.exe': 'pdd',
+    # 拼多多 - 旧版/其他
     'pddmerchant.exe': 'pdd',
     'pdd_merchant.exe': 'pdd',
     'pinduoduo.exe': 'pdd',
@@ -27,12 +35,16 @@ KNOWN_PROCESSES = {
     '拼多多商家工作台-主程序.exe': 'pdd',
     '拼多多商家工作台.exe': 'pdd',
     '拼多多工作台.exe': 'pdd',
+    # 京东
     'jd_merchant.exe': 'jd',
     'jdmerchant.exe': 'jd',
     'jingdong.exe': 'jd',
+    # 淘宝/千牛
     'AliWorkbench.exe': 'taobao',
     'qianniu.exe': 'taobao',
+    # 抖音
     'DouyinMerchant.exe': 'douyin',
+    # 快手
     'kwai_merchant.exe': 'kwai',
 }
 
@@ -40,6 +52,8 @@ KNOWN_PROCESSES = {
 TITLE_KEYWORDS = {
     '拼多多': 'pdd', 'pinduoduo': 'pdd',
     'PddBrowser': 'pdd',
+    'PddWorkbench': 'pdd',
+    'pddworkbench': 'pdd',
     '拼多多工作台': 'pdd',
     '拼多多商家工作台': 'pdd',
     '京东': 'jd', '千牛': 'taobao',
@@ -53,7 +67,7 @@ PLATFORM_NAMES = {
 }
 
 
-@dataclass
+dataclass
 class NetworkConn:
     """网络连接信息"""
     local_ip: str = ''
@@ -64,7 +78,7 @@ class NetworkConn:
     is_ws_candidate: bool = False  # 远端 443/80/8080 的 ESTABLISHED 连接
 
 
-@dataclass
+dataclass
 class ShopProcess:
     """店铺进程信息（完整字段）"""
     pid: int = 0
@@ -161,6 +175,8 @@ def _get_local_data_dirs(proc_name: str) -> list:
         '拼多多商家版',
         'pddmerchant',
         'jdmerchant',
+        'PddWorkbench',
+        'pinduoduo',
     ]
     base_dirs = []
     if sys.platform == 'win32':
@@ -419,7 +435,7 @@ class _ScanThread(QThread):
                     # 检查是否为已知平台进程
                     is_known = pname_lower in known_lower
                     if not is_known:
-                        # 进程名包含平台关键词也纳入（如"拼多多工作台"）
+                        # 进程名包含平台关键词也纳入
                         is_known = any(kw in pname_lower for kw in title_kw_lower)
                     if not is_known:
                         continue
