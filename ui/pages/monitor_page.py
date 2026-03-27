@@ -29,7 +29,6 @@ class _DetailWorker(QThread):
     error    = pyqtSignal(str)
 
     def __init__(self, watcher: ProcessWatcher, pid: int):
-        # Fix 4: 不设 parent，避免双重 deleteLater
         super().__init__()
         self._watcher = watcher
         self._pid     = pid
@@ -180,7 +179,7 @@ class MonitorPage(QWidget):
         left_layout.addWidget(self._status_label)
 
         # 进程卡片滚动区
-        scroll = QScrollArea() 
+        scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -207,7 +206,7 @@ class MonitorPage(QWidget):
         right_layout.setSpacing(8)
 
         # 右侧滚动区
-        right_scroll = QScrollArea() 
+        right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QFrame.Shape.NoFrame)
 
@@ -254,7 +253,7 @@ class MonitorPage(QWidget):
         self._watcher.scan_completed.connect(self._on_scan_completed)
 
     def _on_process_found(self, sp: ShopProcess):
-        """添加新进程卡片""" 
+        """添加新进程卡片"""
         card = ProcessCard(sp)
         card.clicked.connect(self._on_card_clicked)
         self._cards[sp.pid] = card
@@ -322,15 +321,30 @@ class MonitorPage(QWidget):
         self._status_label.setText('正在扫描...')
 
     def _clear_detail(self):
-        """清空右侧详情"""
-        while self._detail_layout.count():
-            item = self._detail_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                try:
-                    w.deleteLater()
-                except RuntimeError:
-                    pass
+        """彻底清空右侧详情区域，包括 widget 和 layout 条目"""
+        # 逐一取出并销毁所有子项（含嵌套 layout）
+        def _remove_layout_items(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.hide()
+                    try:
+                        w.deleteLater()
+                    except RuntimeError:
+                        pass
+                else:
+                    sub = item.layout()
+                    if sub is not None:
+                        _remove_layout_items(sub)
+                        try:
+                            sub.deleteLater()
+                        except RuntimeError:
+                            pass
+
+        _remove_layout_items(self._detail_layout)
+
+        # 重置"空占位"提示
         self._no_select_label = QLabel('← 点击左侧进程查看详情')
         self._no_select_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._no_select_label.setStyleSheet('color: #aaa; font-size: 14px; padding: 60px;')
@@ -346,15 +360,27 @@ class MonitorPage(QWidget):
 
     def _show_basic_detail(self, sp: ShopProcess):
         """在右侧显示进程基本详情（使用已缓存数据，不阻塞）"""
-        # 清空旧内容
-        while self._detail_layout.count():
-            item = self._detail_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                try:
-                    w.deleteLater()
-                except RuntimeError:
-                    pass
+        # ── 先彻底清空旧内容（包括嵌套 layout）──
+        def _remove_layout_items(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.hide()
+                    try:
+                        w.deleteLater()
+                    except RuntimeError:
+                        pass
+                else:
+                    sub = item.layout()
+                    if sub is not None:
+                        _remove_layout_items(sub)
+                        try:
+                            sub.deleteLater()
+                        except RuntimeError:
+                            pass
+
+        _remove_layout_items(self._detail_layout)
 
         create_time = getattr(sp, 'create_time', 0) or 0
         elapsed = int(time.time() - create_time) if create_time else 0
@@ -373,7 +399,7 @@ class MonitorPage(QWidget):
             key_lbl = QLabel(label)
             key_lbl.setStyleSheet('font-size: 12px; color: #888; min-width: 90px;')
             key_lbl.setFixedWidth(100)
-            val_lbl = QLabel(value)
+            val_lbl = QLabel(str(value))
             val_lbl.setStyleSheet(f'font-size: 12px; color: {color};')
             val_lbl.setWordWrap(True)
             h_layout.addWidget(key_lbl)
@@ -418,7 +444,6 @@ class MonitorPage(QWidget):
         if debug_port:
             self._detail_layout.addLayout(row('调试端口', str(debug_port), '#e74c3c'))
         for ws in ws_connections[:5]:
-            # Fix 2: ws 可能是 dict 也可能是对象
             if isinstance(ws, dict):
                 remote_ip   = ws.get('remote_ip', '')
                 remote_port = ws.get('remote_port', '')
@@ -430,6 +455,16 @@ class MonitorPage(QWidget):
             self._detail_layout.addLayout(
                 row('', f'{remote_ip}:{remote_port}  [{ws_status}]', '#e74c3c')
             )
+
+        # ── 数据目录 ──
+        local_data_dirs = getattr(sp, 'local_data_dirs', []) or []
+        if local_data_dirs:
+            self._detail_layout.addWidget(section('数据目录'))
+            for d in local_data_dirs[:5]:
+                lbl = QLabel(str(d))
+                lbl.setStyleSheet('font-size: 11px; color: #0078d4;')
+                lbl.setWordWrap(True)
+                self._detail_layout.addWidget(lbl)
 
         # ── 命令行 ──
         cmdline_str = getattr(sp, 'cmdline_str', '')
@@ -461,7 +496,6 @@ class MonitorPage(QWidget):
         if children:
             self._detail_layout.addWidget(section('子进程（最多5个）'))
             for child in children[:5]:
-                # Fix 3: child 可能是 dict 也可能是对象
                 if isinstance(child, dict):
                     c_pid  = str(child.get('pid', ''))
                     c_name = child.get('name', '')
@@ -542,7 +576,7 @@ class MonitorPage(QWidget):
             )
             return
 
-        # Fix 4: 断开旧信号防止重复触发
+        # 断开旧信号防止重复触发
         if self._detail_worker is not None:
             try:
                 self._detail_worker.finished.disconnect()
@@ -585,3 +619,4 @@ class MonitorPage(QWidget):
             position=InfoBarPosition.TOP,
             parent=self
         )
+
