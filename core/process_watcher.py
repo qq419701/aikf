@@ -21,6 +21,9 @@ KNOWN_PROCESSES = {
     'pinduoduo.exe': 'pdd',
     'pddmerchantapp.exe': 'pdd',
     'merchant.exe': 'pdd',
+    'PddBrowser.exe': 'pdd',
+    'pddbrowser.exe': 'pdd',
+    '拼多多工作台-主程序.exe': 'pdd',
     'jd_merchant.exe': 'jd',
     'jdmerchant.exe': 'jd',
     'jingdong.exe': 'jd',
@@ -33,6 +36,8 @@ KNOWN_PROCESSES = {
 # 窗口标题关键词映射
 TITLE_KEYWORDS = {
     '拼多多': 'pdd', 'pinduoduo': 'pdd',
+    'PddBrowser': 'pdd',
+    '拼多多工作台': 'pdd',
     '京东': 'jd', '千牛': 'taobao',
     '旺旺': 'taobao', '抖店': 'douyin', '快手': 'kwai',
 }
@@ -43,7 +48,6 @@ PLATFORM_NAMES = {
     'douyin': '抖音', 'kwai': '快手', 'unknown': '未知',
 }
 
-
 @dataclass
 class NetworkConn:
     """网络连接信息"""
@@ -53,7 +57,6 @@ class NetworkConn:
     remote_port: int = 0
     status: str = ''
     is_ws_candidate: bool = False  # 远端 443/80/8080 的 ESTABLISHED 连接
-
 
 @dataclass
 class ShopProcess:
