@@ -7,7 +7,7 @@
 import time
 from datetime import datetime
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QClipboard
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
@@ -22,8 +22,32 @@ from qfluentwidgets import (
 from core.process_watcher import ProcessWatcher, ShopProcess
 
 
+class _DetailWorker(QThread):
+    """后台深度扫描线程，避免阻塞主线程"""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, watcher: 'ProcessWatcher', pid: int, parent=None):
+        super().__init__(parent)
+        self._watcher = watcher
+        self._pid = pid
+
+    def run(self):
+        try:
+            result = self._watcher.get_process_detail(self._pid)
+            if 'error' in result:
+                self.error.emit(result['error'])
+            else:
+                self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class ProcessCard(QFrame):
     """进程卡片"""
+    # Fix 3: 用 pyqtSignal 替代裸回调
+    clicked = pyqtSignal(int)
+
     NORMAL_STYLE = """
         QFrame {
             background: white;
@@ -32,6 +56,7 @@ class ProcessCard(QFrame):
             padding: 8px;
         }
         QFrame:hover { border-color: #0078d4; }
+        QFrame > QLabel { color: #1a1a1a; background: transparent; }
     """
     SELECTED_STYLE = """
         QFrame {
@@ -40,6 +65,7 @@ class ProcessCard(QFrame):
             border-radius: 8px;
             padding: 8px;
         }
+        QFrame > QLabel { color: #1a1a1a; background: transparent; }
     """
 
     def __init__(self, sp: ShopProcess, parent=None):
@@ -66,14 +92,14 @@ class ProcessCard(QFrame):
         row1.addWidget(status_label)
 
         name_label = QLabel(f'{self.sp.platform_name} · {self.sp.name}')
-        name_label.setStyleSheet('font-weight: bold; font-size: 13px;')
+        name_label.setStyleSheet('font-weight: bold; font-size: 13px; color: #1a1a1a;')
         row1.addWidget(name_label)
         row1.addStretch()
         layout.addLayout(row1)
 
         # 第二行：PID + 内存
         pid_label = QLabel(f'PID: {self.sp.pid}  内存: {self.sp.memory_mb:.1f} MB')
-        pid_label.setStyleSheet('font-size: 11px; color: #888;')
+        pid_label.setStyleSheet('font-size: 11px; color: #555;')
         layout.addWidget(pid_label)
 
         # 第三行：店铺名（有的话）
@@ -88,13 +114,15 @@ class ProcessCard(QFrame):
         self.setStyleSheet(self.SELECTED_STYLE if selected else self.NORMAL_STYLE)
 
     def set_click_callback(self, callback):
-        """设置点击回调"""
+        """兼容旧接口"""
         self._click_callback = callback
 
     def mousePressEvent(self, event):
         """点击卡片"""
-        if event.button() == Qt.MouseButton.LeftButton and self._click_callback:
-            self._click_callback(self.sp.pid)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.sp.pid)
+            if self._click_callback:
+                self._click_callback(self.sp.pid)
 
 
 class MonitorPage(QWidget):
@@ -105,6 +133,7 @@ class MonitorPage(QWidget):
         self._watcher = watcher
         self._cards: dict = {}       # pid -> ProcessCard
         self._selected_pid: int = -1
+        self._detail_worker: _DetailWorker = None
         self.setObjectName('monitorPage')
         self._setup_ui()
         self._connect_signals()
@@ -218,7 +247,7 @@ class MonitorPage(QWidget):
     def _on_process_found(self, sp: ShopProcess):
         """添加新进程卡片"""
         card = ProcessCard(sp)
-        card.set_click_callback(self._on_card_clicked)
+        card.clicked.connect(self._on_card_clicked)
         self._cards[sp.pid] = card
         self._cards_layout.addWidget(card)
         self._empty_label.hide()
@@ -244,16 +273,16 @@ class MonitorPage(QWidget):
             old_card = self._cards[sp.pid]
             idx = self._cards_layout.indexOf(old_card)
             new_card = ProcessCard(sp)
-            new_card.set_click_callback(self._on_card_clicked)
+            new_card.clicked.connect(self._on_card_clicked)
             if self._selected_pid == sp.pid:
                 new_card.set_selected(True)
             self._cards_layout.insertWidget(idx, new_card)
             self._cards_layout.removeWidget(old_card)
             old_card.deleteLater()
             self._cards[sp.pid] = new_card
-            # 刷新右侧详情
+            # 刷新右侧基本详情（不阻塞）
             if self._selected_pid == sp.pid:
-                self._show_detail(sp)
+                self._show_basic_detail(sp)
 
     def _on_scan_completed(self, processes: list):
         """扫描完成，更新时间戳"""
@@ -261,17 +290,17 @@ class MonitorPage(QWidget):
         self._status_label.setText(f'自动扫描中... 上次: {now}')
 
     def _on_card_clicked(self, pid: int):
-        """点击卡片，显示右侧详情"""
+        """点击卡片，仅显示已缓存的基本信息（不阻塞主线程）"""
         # 取消旧选中
         if self._selected_pid in self._cards:
             self._cards[self._selected_pid].set_selected(False)
         self._selected_pid = pid
         if pid in self._cards:
             self._cards[pid].set_selected(True)
-        # 找到进程信息
-        for sp in self._watcher.get_all() if self._watcher else []:
+        # 用缓存的 ShopProcess 对象，不调用任何阻塞 IO
+        for sp in (self._watcher.get_all() if self._watcher else []):
             if sp.pid == pid:
-                self._show_detail(sp)
+                self._show_basic_detail(sp)
                 return
 
     def _on_force_scan(self):
@@ -291,8 +320,8 @@ class MonitorPage(QWidget):
         self._no_select_label.setStyleSheet('color: #aaa; font-size: 14px; padding: 60px;')
         self._detail_layout.addWidget(self._no_select_label)
 
-    def _show_detail(self, sp: ShopProcess):
-        """在右侧显示进程详情"""
+    def _show_basic_detail(self, sp: ShopProcess):
+        """在右侧显示进程基本详情（使用已缓存数据，不阻塞）"""
         # 清空旧内容
         while self._detail_layout.count():
             item = self._detail_layout.takeAt(0)
@@ -311,86 +340,57 @@ class MonitorPage(QWidget):
             return lbl
 
         def row(label: str, value: str, color: str = '#333') -> QHBoxLayout:
-            lo = QHBoxLayout()
-            lo.setSpacing(8)
-            k = QLabel(f'{label}:')
-            k.setStyleSheet('color: #888; font-size: 12px; min-width: 90px;')
-            v = QLabel(value)
-            v.setStyleSheet(f'color: {color}; font-size: 12px;')
-            v.setWordWrap(True)
-            lo.addWidget(k)
-            lo.addWidget(v)
-            lo.addStretch()
-            return lo
+            h_layout = QHBoxLayout()
+            key_lbl = QLabel(label)
+            key_lbl.setStyleSheet('font-size: 12px; color: #888; min-width: 90px;')
+            key_lbl.setFixedWidth(100)
+            val_lbl = QLabel(value)
+            val_lbl.setStyleSheet(f'font-size: 12px; color: {color};')
+            val_lbl.setWordWrap(True)
+            h_layout.addWidget(key_lbl)
+            h_layout.addWidget(val_lbl, 1)
+            return h_layout
 
-        # ── 基础信息 ──
-        self._detail_layout.addWidget(section('基础信息'))
-        name_lbl = QLabel(sp.name)
-        name_lbl.setStyleSheet('font-size: 18px; font-weight: bold; color: #222;')
-        self._detail_layout.addWidget(name_lbl)
-        self._detail_layout.addLayout(row('运行状态', sp.status, '#2e7d32'))
+        # ── 基本信息 ──
+        self._detail_layout.addWidget(section('基本信息'))
+        self._detail_layout.addLayout(row('进程名', sp.name))
         self._detail_layout.addLayout(row('PID', str(sp.pid)))
-        self._detail_layout.addLayout(row('平台', sp.platform_name))
+        self._detail_layout.addLayout(row('平台', sp.platform_name, '#0078d4'))
+        self._detail_layout.addLayout(row('状态', sp.status,
+                                          '#00a550' if sp.status == 'running' else '#e67e22'))
         self._detail_layout.addLayout(row('路径', sp.exe_path or '未知'))
-        self._detail_layout.addLayout(row('启动时间', sp.create_time_str or '未知'))
-        self._detail_layout.addLayout(row('CPU', f'{sp.cpu_percent:.1f}%'))
         self._detail_layout.addLayout(row('内存', f'{sp.memory_mb:.1f} MB'))
+        self._detail_layout.addLayout(row('CPU', f'{sp.cpu_percent:.1f}%'))
+        self._detail_layout.addLayout(row('启动时间', sp.create_time_str))
+        self._detail_layout.addLayout(row('运行时长', f'{h}h {m}m {s}s'))
+
+        # ── 店铺信息 ──
+        if sp.shop_name or sp.window_titles:
+            self._detail_layout.addWidget(section('店铺信息'))
+            if sp.shop_name:
+                self._detail_layout.addLayout(row('店铺名', sp.shop_name, '#0078d4'))
+            if sp.window_titles:
+                self._detail_layout.addLayout(row('窗口标题', sp.window_titles[0]))
 
         # ── 网络连接 ──
         self._detail_layout.addWidget(section('网络连接'))
-        self._detail_layout.addLayout(row('TCP连接总数', str(sp.tcp_count)))
-        ws_count = len(sp.ws_connections)
-        self._detail_layout.addLayout(row('疑似WS连接数', str(ws_count), '#0078d4' if ws_count else '#333'))
-        for conn in sp.ws_connections:
-            ws_lbl = QLabel(f'⭐ {conn.remote_ip}:{conn.remote_port}  [{conn.status}]')
-            ws_lbl.setStyleSheet('font-size: 12px; color: #0078d4; padding-left: 100px;')
-            self._detail_layout.addWidget(ws_lbl)
-
-        # ── 本地数据目录 ──
-        self._detail_layout.addWidget(section('本地数据目录'))
-        if sp.local_data_dirs:
-            for d in sp.local_data_dirs:
-                self._detail_layout.addLayout(row('目录', d))
-            cookies = sp.data_files.get('cookies_files', [])
-            local_storage = sp.data_files.get('local_storage_dirs', [])
-            indexeddb = sp.data_files.get('indexeddb_dirs', [])
-            json_configs = sp.data_files.get('json_configs', [])
-            self._detail_layout.addLayout(
-                row('Cookies', '✅ 存在' if cookies else '❌ 未找到',
-                    '#2e7d32' if cookies else '#e53935')
-            )
-            self._detail_layout.addLayout(
-                row('Local Storage', '✅ 存在' if local_storage else '❌ 未找到',
-                    '#2e7d32' if local_storage else '#e53935')
-            )
-            self._detail_layout.addLayout(
-                row('IndexedDB', '✅ 存在' if indexeddb else '❌ 未找到',
-                    '#2e7d32' if indexeddb else '#e53935')
-            )
-            self._detail_layout.addLayout(row('配置文件数量', str(len(json_configs))))
-        else:
-            self._detail_layout.addWidget(QLabel('  未找到本地数据目录'))
-
-        # ── 调试信息 ──
-        self._detail_layout.addWidget(section('调试信息'))
+        self._detail_layout.addLayout(row('TCP连接数', str(sp.tcp_count)))
+        self._detail_layout.addLayout(
+            row('WS候选连接', str(len(sp.ws_connections)),
+                '#e74c3c' if sp.ws_connections else '#333')
+        )
         if sp.debug_port:
+            self._detail_layout.addLayout(row('调试端口', str(sp.debug_port), '#e74c3c'))
+        for ws in sp.ws_connections[:5]:
             self._detail_layout.addLayout(
-                row('CDP调试端口', f'✅ {sp.debug_port}', '#2e7d32')
+                row('', f'{ws.remote_ip}:{ws.remote_port}  [{ws.status}]', '#e74c3c')
             )
-        else:
-            self._detail_layout.addLayout(row('CDP调试端口', '❌ 未开启', '#e53935'))
-        for title in sp.window_titles:
-            self._detail_layout.addLayout(row('窗口标题', title))
-        if sp.shop_name:
-            self._detail_layout.addLayout(row('疑似店铺名', sp.shop_name, '#0078d4'))
-        self._detail_layout.addLayout(row('疑似Token数量', str(len(sp.suspected_tokens))))
 
-        # ── 命令行参数 ──
+        # ── 命令行 ──
         if sp.cmdline_str:
-            self._detail_layout.addWidget(section('命令行参数'))
-            cmd_box = QPlainTextEdit()
+            self._detail_layout.addWidget(section('命令行'))
+            cmd_box = QPlainTextEdit(sp.cmdline_str)
             cmd_box.setReadOnly(True)
-            cmd_box.setPlainText(sp.cmdline_str)
             cmd_box.setMaximumHeight(80)
             font = QFont('Consolas', 10)
             font.setStyleHint(QFont.StyleHint.Monospace)
@@ -417,7 +417,16 @@ class MonitorPage(QWidget):
                     row(str(child.get('pid')), child.get('name', ''))
                 )
 
+        # 提示用户可做深度扫描
+        hint = QLabel('点击「🔍 深度扫描」获取数据目录、IndexedDB 等更多信息')
+        hint.setStyleSheet('color: #aaa; font-size: 11px; padding-top: 8px;')
+        self._detail_layout.addWidget(hint)
+
         self._detail_layout.addStretch()
+
+    # 保留旧名以防外部引用
+    def _show_detail(self, sp: ShopProcess):
+        self._show_basic_detail(sp)
 
     def _on_copy_info(self):
         """复制全部进程信息到剪贴板"""
@@ -460,23 +469,51 @@ class MonitorPage(QWidget):
         )
 
     def _on_deep_scan(self):
-        """深度扫描当前选中进程"""
+        """后台深度扫描当前选中进程，不阻塞 UI"""
         if self._selected_pid < 0 or not self._watcher:
             return
-        detail = self._watcher.get_process_detail(self._selected_pid)
-        if 'error' in detail:
-            InfoBar.error(
-                title='深度扫描失败',
-                content=detail['error'],
-                duration=3000,
+
+        # 防止重复启动
+        if self._detail_worker and self._detail_worker.isRunning():
+            InfoBar.warning(
+                title='扫描中',
+                content='深度扫描正在进行，请稍候...',
+                duration=2000,
                 position=InfoBarPosition.TOP,
                 parent=self
             )
-        else:
-            InfoBar.success(
-                title='深度扫描完成',
-                content=f'IndexedDB文件: {detail.get("data_files", {}).get("indexeddb_files", 0)} 个',
-                duration=3000,
-                position=InfoBarPosition.TOP,
-                parent=self
-            )
+            return
+
+        self._deep_scan_btn.setEnabled(False)
+        self._deep_scan_btn.setText('⏳ 扫描中...')
+
+        self._detail_worker = _DetailWorker(self._watcher, self._selected_pid, self)
+        self._detail_worker.finished.connect(self._on_deep_scan_finished)
+        self._detail_worker.error.connect(self._on_deep_scan_error)
+        self._detail_worker.start()
+
+    def _on_deep_scan_finished(self, detail: dict):
+        """深度扫描完成"""
+        self._deep_scan_btn.setEnabled(True)
+        self._deep_scan_btn.setText('🔍 深度扫描')
+        idb_files = detail.get('data_files', {}).get('indexeddb_files', 0)
+        cookies = detail.get('data_files', {}).get('cookies_count', 0)
+        InfoBar.success(
+            title='深度扫描完成',
+            content=f'IndexedDB文件: {idb_files} 个  Cookies: {cookies} 个',
+            duration=3000,
+            position=InfoBarPosition.TOP,
+            parent=self
+        )
+
+    def _on_deep_scan_error(self, msg: str):
+        """深度扫描失败"""
+        self._deep_scan_btn.setEnabled(True)
+        self._deep_scan_btn.setText('🔍 深度扫描')
+        InfoBar.error(
+            title='深度扫描失败',
+            content=msg,
+            duration=3000,
+            position=InfoBarPosition.TOP,
+            parent=self
+        )
