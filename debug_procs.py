@@ -14,11 +14,11 @@ for proc in psutil.process_iter(['pid', 'name', 'exe']):
     try:
         name = proc.info['name'] or ''
         pid = proc.info['pid']
-        exe = proc.info['exe'] or ''
+        exe = proc.info.get('exe') or ''
         name_lower = name.lower()
         exe_lower = exe.lower()
         if any(kw in name_lower or kw in exe_lower for kw in keywords):
-            print(f"PID={{pid:6d}}  name={{name!r:50s}}  exe={{exe}}")
+            print(f"PID={{pid:<6d}}  name={{name!r:<50s}}  exe={{exe}}")
     except Exception as e:
         pass
 
