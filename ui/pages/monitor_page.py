@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QScrollArea, QLabel, QFrame, QPlainTextEdit,
-    QApplication
+    QApplication, QDialog, QDialogButtonBox, QListWidget
 )
 from qfluentwidgets import (
     SubtitleLabel, CaptionLabel,
@@ -594,19 +594,62 @@ class MonitorPage(QWidget):
         self._detail_worker.start()
 
     def _on_deep_scan_finished(self, detail: dict):
-        """深度扫描完成"""
+        """深度扫描完成，弹出摘要对话框"""
         self._deep_scan_btn.setEnabled(True)
         self._deep_scan_btn.setText('🔍 深度扫描')
-        data_files  = detail.get('data_files', {}) or {}
-        idb_files   = data_files.get('indexeddb_files', 0)
-        cookies     = data_files.get('cookies_count', 0)
-        InfoBar.success(
-            title='深度扫描完成',
-            content=f'IndexedDB文件: {idb_files} 个  Cookies: {cookies} 个',
-            duration=3000,
-            position=InfoBarPosition.TOP,
-            parent=self
-        )
+
+        data_files = detail.get('data_files', {}) or {}
+        scan_data = detail.get('scan_all_data', {}) or {}
+
+        idb_files = data_files.get('indexeddb_files', 0)
+        cookies_count = len(scan_data.get('cookies', [])) if scan_data else data_files.get('cookies_count', 0)
+        db_file_list = data_files.get('db_files', []) or []
+        ls_count = len(scan_data.get('local_storage', [])) if scan_data else 0
+
+        # 构建摘要对话框
+        dlg = QDialog(self)
+        dlg.setWindowTitle('深度扫描结果')
+        dlg.resize(560, 420)
+        dlg_layout = QVBoxLayout(dlg)
+
+        # 统计信息行
+        stats_row = QHBoxLayout()
+
+        def stat_card(text: str, color: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f'font-size: 13px; font-weight: bold; color: {color}; '
+                'background: #f8f8f8; border-radius: 6px; padding: 8px 14px;'
+            )
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            return lbl
+
+        stats_row.addWidget(stat_card(f'IndexedDB 文件\n{idb_files} 个', '#0078d4'))
+        stats_row.addWidget(stat_card(f'Cookies\n{cookies_count} 条', '#00a550'))
+        stats_row.addWidget(stat_card(f'本地存储条目\n{ls_count} 条', '#8e44ad'))
+        stats_row.addWidget(stat_card(f'.db/.sqlite 文件\n{len(db_file_list)} 个', '#e67e22'))
+        dlg_layout.addLayout(stats_row)
+
+        # .db 文件列表
+        if db_file_list:
+            dlg_layout.addWidget(QLabel('检测到的 .db 文件（最多20条）：'))
+            db_list = QListWidget()
+            db_list.setAlternatingRowColors(True)
+            for fpath in db_file_list[:20]:
+                db_list.addItem(str(fpath))
+            db_list.setMaximumHeight(140)
+            dlg_layout.addWidget(db_list)
+
+        # 提示语
+        hint = QLabel('💡 完整数据请前往「数据检测」页面查看')
+        hint.setStyleSheet('color: #0078d4; font-size: 12px; padding: 6px 0;')
+        dlg_layout.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        btns.accepted.connect(dlg.accept)
+        dlg_layout.addWidget(btns)
+
+        dlg.exec()
 
     def _on_deep_scan_error(self, msg: str):
         """深度扫描失败"""

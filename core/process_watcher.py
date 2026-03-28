@@ -592,7 +592,13 @@ class ProcessWatcher(QObject):
         return []
 
     def get_process_detail(self, pid: int) -> dict:
-        """深度扫描指定进程，返回详细信息字典"""
+        """深度扫描指定进程，返回详细信息字典（含 scan_all_data 深度数据）"""
+        # 延迟导入，避免循环依赖
+        try:
+            from core import db_reader as _db_reader
+        except Exception:
+            _db_reader = None
+
         try:
             proc = psutil.Process(pid)
             sp = _collect_process_info(proc)
@@ -616,8 +622,24 @@ class ProcessWatcher(QObject):
                 {
                     'remote': f'{c.remote_ip}:{c.remote_port}',
                     'status': c.status,
+                    'local_ip': c.local_ip,
+                    'local_port': c.local_port,
+                    'remote_ip': c.remote_ip,
+                    'remote_port': c.remote_port,
+                    'is_ws_candidate': c.is_ws_candidate,
                 }
                 for c in sp.ws_connections
+            ],
+            'all_connections': [
+                {
+                    'local_ip': c.local_ip,
+                    'local_port': c.local_port,
+                    'remote_ip': c.remote_ip,
+                    'remote_port': c.remote_port,
+                    'status': c.status,
+                    'is_ws_candidate': c.is_ws_candidate,
+                }
+                for c in sp.connections
             ],
             'open_files': sp.open_files,
             'local_data_dirs': sp.local_data_dirs,
@@ -626,6 +648,7 @@ class ProcessWatcher(QObject):
             'suspected_tokens_count': len(sp.suspected_tokens),
             'children': sp.children,
             'env_relevant_keys': list(sp.env_relevant.keys()),
+            'scan_all_data': {},  # 由 db_reader.scan_all() 填充
         }
 
         # 深度扫描数据目录
@@ -647,8 +670,24 @@ class ProcessWatcher(QObject):
                     except Exception:
                         pass
                 detail_data_files['indexeddb_files'] = idb_count
+                # 补充 cookies/local_storage 路径列表，供 DetectPage 使用
+                detail_data_files['cookies_paths'] = sp.data_files.get('cookies_files', [])
+                detail_data_files['local_storage_dirs'] = sp.data_files.get('local_storage_dirs', [])
+                detail_data_files['indexeddb_dirs'] = sp.data_files.get('indexeddb_dirs', [])
         except Exception:
             pass
         result['data_files'] = detail_data_files
+
+        # 调用 db_reader.scan_all() 深度读取本地数据库内容
+        if _db_reader is not None:
+            try:
+                result['scan_all_data'] = _db_reader.scan_all(
+                    data_dirs=sp.local_data_dirs or [],
+                    cookies_files=detail_data_files.get('cookies_paths', []),
+                    indexeddb_dirs=detail_data_files.get('indexeddb_dirs', []),
+                    local_storage_dirs=detail_data_files.get('local_storage_dirs', []),
+                )
+            except Exception as e:
+                result['scan_all_data'] = {'error': str(e)}
 
         return result
