@@ -16,6 +16,7 @@ from core.notify import Notifier
 from core.db import Database
 from ui.pages.dashboard_page import DashboardPage
 from ui.pages.monitor_page import MonitorPage
+from ui.pages.detect_page import DetectPage
 from ui.pages.ai_page import AiPage
 from ui.pages.knowledge_page import KnowledgePage
 from ui.pages.rules_page import RulesPage
@@ -83,6 +84,10 @@ class MainWindow(FluentWindow):
         # 进程监控（默认选中）
         self._monitor = MonitorPage(watcher=self._watcher)
         self.addSubInterface(self._monitor, FluentIcon.SEARCH, '进程监控')
+
+        # 数据检测（进程监控之后）
+        self._detect = DetectPage(watcher=self._watcher)
+        self.addSubInterface(self._detect, FluentIcon.SEARCH_MIRROR, '数据检测')
 
         # AI 设置
         self._ai = AiPage()
