@@ -591,6 +591,40 @@ class ProcessWatcher(QObject):
             return self._thread.get_all()
         return []
 
+    def restart_process_with_debug_port(self, pid: int, port: int = 9222) -> tuple:
+        """
+        尝试重启指定进程并附加 CDP 调试端口参数。
+
+        步骤：
+        1. 通过 pid 获取进程的可执行路径和命令行参数
+        2. 向命令行追加 --remote-debugging-port=<port>（若尚未存在）
+        3. 终止旧进程，以新命令行重新启动
+
+        返回: (success: bool, message: str)
+        """
+        import subprocess as _subprocess
+        try:
+            proc = psutil.Process(pid)
+            cmdline = proc.cmdline()  # 获取原始命令行参数
+
+            debug_flag = f'--remote-debugging-port={port}'
+            # 如果已有调试参数，无需重复添加（精确前缀匹配，避免误判其他端口号）
+            if not any(arg.startswith('--remote-debugging-port=') for arg in cmdline):
+                cmdline.append(debug_flag)
+
+            # 先终止旧进程
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                proc.kill()
+
+            # 以新命令行启动进程
+            _subprocess.Popen(cmdline)  # noqa: S603
+            return True, f'进程已重启，调试端口: {port}'
+        except Exception as exc:
+            return False, str(exc)
+
     def get_process_detail(self, pid: int) -> dict:
         """深度扫描指定进程，返回详细信息字典（含 scan_all_data 深度数据）"""
         # 延迟导入，避免循环依赖

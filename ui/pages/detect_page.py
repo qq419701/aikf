@@ -6,17 +6,19 @@ CDP 数据检测页面
 """
 
 import json
+import subprocess
 import threading
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+import psutil
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QPlainTextEdit,
     QApplication, QSplitter, QListWidget, QListWidgetItem,
-    QTabWidget, QLineEdit, QFrame,
+    QTabWidget, QLineEdit, QFrame, QMessageBox,
 )
 from qfluentwidgets import (
     SubtitleLabel, CaptionLabel,
@@ -94,6 +96,49 @@ class _NetworkWorker(QThread):
                 pass
 
 
+# ─────────────────────── 后台进程重启线程 ─────────────────────────────────
+class _RestartWorker(QThread):
+    """
+    后台进程重启线程：
+    终止旧进程，添加 --remote-debugging-port 参数后重新启动，不阻塞 UI。
+    """
+    # 重启完成信号：(成功与否, 提示消息)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, pid: int, port: int = 9222):
+        super().__init__()
+        self._pid = pid      # 需要重启的进程 PID
+        self._port = port    # 要附加的调试端口号（默认 9222）
+
+    def run(self):
+        """在后台线程中执行：终止旧进程 → 附加调试参数 → 重新启动"""
+        try:
+            proc = psutil.Process(self._pid)
+            cmdline = proc.cmdline()  # 获取原始命令行参数列表
+
+            debug_flag = f'--remote-debugging-port={self._port}'
+            # 如果命令行中还没有调试端口参数，则追加（精确前缀匹配，避免误判其他端口号）
+            if not any(arg.startswith('--remote-debugging-port=') for arg in cmdline):
+                cmdline.append(debug_flag)
+
+            # 终止旧进程（先 terminate，超时后 kill）
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                proc.kill()
+
+            # 用修改后的命令行重新启动进程
+            subprocess.Popen(cmdline)  # noqa: S603 — 命令来自用户已运行进程的原始 cmdline
+            self.finished.emit(
+                True,
+                f'进程已重启，调试端口: {self._port}。'
+                '请等待软件完全启动后，再点击「一键检测并扫描」。'
+            )
+        except Exception as exc:
+            self.finished.emit(False, f'重启失败: {exc}')
+
+
 # ─────────────────────── 工具函数 ──────────────────────────────────────────
 def _make_table(columns: list) -> QTableWidget:
     """创建统一风格的只读表格：交替行颜色、禁止编辑、列宽自适应"""
@@ -117,6 +162,11 @@ def _item(text: str, color: str = None) -> QTableWidgetItem:
         it.setForeground(QColor(color))
     return it
 
+# 弹出无调试端口提示对话框的延迟（毫秒）
+# 延迟是为了避免在 currentIndexChanged 信号处理函数中直接弹出对话框，
+# 防止 Qt 在信号栈仍在运行时处理模态窗口事件循环导致的异常。
+_DIALOG_DELAY_MS = 300
+
 
 # ─────────────────────── CDP 检测页面主体 ──────────────────────────────────
 class DetectPage(QWidget):
@@ -131,9 +181,11 @@ class DetectPage(QWidget):
         self._watcher: ProcessWatcher = watcher
         self._scan_worker: _CdpScanWorker = None   # CDP 扫描线程
         self._net_worker: _NetworkWorker = None     # 网络监听线程
+        self._restart_worker: _RestartWorker = None # 进程重启线程
         self._last_data: dict = {}                  # 上次扫描结果缓存
         self._pages: list = []                      # 当前端口的页面列表
         self._net_monitoring: bool = False          # 是否正在监听网络
+        self._pending_no_debug_sp = None            # 待处理的无调试端口进程
         self.setObjectName('detectPage')
         self._setup_ui()
         self._connect_watcher_signals()
@@ -147,10 +199,11 @@ class DetectPage(QWidget):
 
         # 顶部标题栏
         title_bar = QHBoxLayout()
-        title_lbl = SubtitleLabel('🔌 CDP 实时数据检测')
+        title_lbl = SubtitleLabel('📡 数据实时检测')
         title_bar.addWidget(title_lbl)
         title_bar.addStretch()
-        self._status_lbl = CaptionLabel('请选择进程或输入调试端口后点击「连接」')
+        # 状态标签：提示用户当前操作状态
+        self._status_lbl = CaptionLabel('请选择软件进程后点击「一键检测并扫描」')
         self._status_lbl.setStyleSheet('color: #888;')
         title_bar.addWidget(self._status_lbl)
         root.addLayout(title_bar)
@@ -166,8 +219,9 @@ class DetectPage(QWidget):
         left_layout.setContentsMargins(0, 0, 6, 0)
         left_layout.setSpacing(8)
 
-        proc_lbl = QLabel('选择进程:')
-        proc_lbl.setStyleSheet('font-size: 12px; color: #555;')
+        # 进程选择下拉框：列出当前检测到的客服软件进程
+        proc_lbl = QLabel('第一步：选择客服软件进程')
+        proc_lbl.setStyleSheet('font-size: 12px; color: #555; font-weight: bold;')
         left_layout.addWidget(proc_lbl)
         self._proc_combo = ComboBox()
         self._proc_combo.setMinimumWidth(200)
@@ -175,19 +229,38 @@ class DetectPage(QWidget):
         self._proc_combo.currentIndexChanged.connect(self._on_proc_changed)
         left_layout.addWidget(self._proc_combo)
 
-        port_lbl = QLabel('或手动输入调试端口:')
-        port_lbl.setStyleSheet('font-size: 12px; color: #555;')
+        # 一键检测按钮：核心操作，自动判断是否需要开启调试模式
+        self._one_click_btn = PrimaryPushButton('🚀 一键检测并扫描')
+        self._one_click_btn.setFixedHeight(38)
+        self._one_click_btn.setToolTip(
+            '自动检测进程是否开启调试模式，未开启时提示重启，开启后自动连接采集数据'
+        )
+        self._one_click_btn.clicked.connect(self._on_one_click_detect)
+        left_layout.addWidget(self._one_click_btn)
+
+        # 分隔线：区分常用操作与高级选项
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet('color: #ddd; margin: 4px 0;')
+        left_layout.addWidget(sep)
+
+        # 高级选项：手动输入调试端口（适合已知端口的高级用户）
+        port_lbl = QLabel('高级：手动输入调试端口')
+        port_lbl.setStyleSheet('font-size: 11px; color: #999;')
         left_layout.addWidget(port_lbl)
         self._port_input = QLineEdit()
         self._port_input.setPlaceholderText('例如: 9222')
         self._port_input.setMaximumHeight(32)
         left_layout.addWidget(self._port_input)
 
-        self._connect_btn = PrimaryPushButton('🔗 连接并扫描')
-        self._connect_btn.setFixedHeight(34)
+        # 手动连接按钮：使用输入框中的端口直接连接（高级用户用）
+        self._connect_btn = PushButton('🔗 手动连接')
+        self._connect_btn.setFixedHeight(30)
+        self._connect_btn.setToolTip('使用上方输入框中的端口直接连接扫描（高级选项）')
         self._connect_btn.clicked.connect(self._on_connect)
         left_layout.addWidget(self._connect_btn)
 
+        # 页面列表：显示目标进程中已打开的页面
         page_list_lbl = QLabel('页面列表:')
         page_list_lbl.setStyleSheet('font-size: 12px; color: #555; margin-top: 8px;')
         left_layout.addWidget(page_list_lbl)
@@ -247,7 +320,7 @@ class DetectPage(QWidget):
         layout.addWidget(hint)
         self._tbl_chat = _make_table(['序号', '内容（前500字）', 'HTML（前200字）'])
         layout.addWidget(self._tbl_chat)
-        self._chat_hint = QLabel('点击左侧「连接并扫描」获取聊天消息')
+        self._chat_hint = QLabel('点击左侧「一键检测并扫描」获取聊天消息')
         self._chat_hint.setStyleSheet('color: #aaa; font-size: 13px; padding: 20px;')
         self._chat_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._chat_hint)
@@ -350,7 +423,11 @@ class DetectPage(QWidget):
             pass
 
     def _on_proc_changed(self, index: int):
-        """切换进程时，自动填入对应的调试端口"""
+        """
+        切换进程时的处理：
+        - 如果进程有调试端口，自动填入端口号
+        - 如果进程没有调试端口（debug_port == 0），延迟弹出提示对话框
+        """
         try:
             if not self._watcher or index < 0:
                 return
@@ -359,8 +436,14 @@ class DetectPage(QWidget):
                 return
             procs = self._watcher.get_all()
             for sp in procs:
-                if sp.pid == pid and getattr(sp, 'debug_port', 0):
-                    self._port_input.setText(str(sp.debug_port))
+                if sp.pid == pid:
+                    if getattr(sp, 'debug_port', 0):
+                        # 有调试端口：自动填入，可直接点击扫描
+                        self._port_input.setText(str(sp.debug_port))
+                    else:
+                        # 无调试端口：保存进程信息，延迟弹出提示（避免在信号中直接弹窗）
+                        self._pending_no_debug_sp = sp
+                        QTimer.singleShot(_DIALOG_DELAY_MS, self._show_no_debug_port_dialog)
                     break
         except Exception:
             pass
@@ -396,18 +479,19 @@ class DetectPage(QWidget):
         return 0
 
     def _on_connect(self):
-        """点击「连接并扫描」：启动 _CdpScanWorker 后台线程"""
+        """点击「手动连接」：使用输入框中的端口直接启动 CDP 扫描（高级选项）"""
         port = self._get_debug_port()
         if not port:
             InfoBar.warning(
                 title='未指定调试端口',
-                content='请先选择检测到的进程，或在输入框中手动填写 CDP 调试端口（如 9222）',
+                content='请先在输入框中手动填写调试端口号（如 9222），或使用「一键检测并扫描」',
                 duration=4000,
                 position=InfoBarPosition.TOP,
                 parent=self,
             )
             return
         self._connect_btn.setEnabled(False)
+        self._one_click_btn.setEnabled(False)
         self._status_lbl.setText(f'正在连接端口 {port}，扫描所有页面...')
         self._refresh_page_list(port)
         if self._scan_worker and self._scan_worker.isRunning():
@@ -416,6 +500,130 @@ class DetectPage(QWidget):
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.error.connect(self._on_scan_error)
         self._scan_worker.start()
+
+    # ──────────── 一键检测并扫描 ──────────────────────────────────────────
+    def _on_one_click_detect(self):
+        """
+        一键检测并扫描的完整流程：
+        1. 检查当前选中进程是否已开启调试端口
+        2. 若未开启：弹出对话框询问是否重启并启用调试模式
+        3. 若已开启（或端口已手动填写）：直接连接 CDP 采集数据
+        """
+        try:
+            idx = self._proc_combo.currentIndex()
+            if self._watcher and idx >= 0:
+                pid = self._proc_combo.itemData(idx)
+                if pid:
+                    for sp in self._watcher.get_all():
+                        if sp.pid == pid:
+                            if getattr(sp, 'debug_port', 0):
+                                # 进程已有调试端口，自动填入并开始扫描
+                                self._port_input.setText(str(sp.debug_port))
+                                self._do_connect_scan(sp.debug_port)
+                            else:
+                                # 进程未开启调试端口，弹出提示让用户决策
+                                self._pending_no_debug_sp = sp
+                                self._show_no_debug_port_dialog()
+                            return
+        except Exception:
+            pass
+        # 没有匹配进程时，尝试使用输入框中的端口
+        port = self._get_debug_port()
+        if port:
+            self._do_connect_scan(port)
+        else:
+            InfoBar.warning(
+                title='未选择进程',
+                content='请先从上方下拉框选择一个客服软件进程，再点击「一键检测并扫描」',
+                duration=4000,
+                position=InfoBarPosition.TOP,
+                parent=self,
+            )
+
+    def _do_connect_scan(self, port: int):
+        """实际执行 CDP 连接和扫描的内部方法"""
+        self._connect_btn.setEnabled(False)
+        self._one_click_btn.setEnabled(False)
+        self._status_lbl.setText(f'正在连接端口 {port}，扫描所有页面...')
+        self._refresh_page_list(port)
+        if self._scan_worker and self._scan_worker.isRunning():
+            self._scan_worker.quit()
+        self._scan_worker = _CdpScanWorker(port)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.error.connect(self._on_scan_error)
+        self._scan_worker.start()
+
+    # ──────────── 调试端口提示与重启 ──────────────────────────────────────
+    def _show_no_debug_port_dialog(self):
+        """
+        当选中的进程未开启调试模式时弹出提示对话框。
+        提供「重启并启用调试」和「取消」两个选项，尽量简单直观。
+        """
+        sp = self._pending_no_debug_sp
+        self._pending_no_debug_sp = None
+        if not sp:
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle('未开启调试模式')
+        msg.setText(
+            f'所选进程「{sp.name}」未处于调试模式，无法直接采集数据。\n\n'
+            '是否重启该进程并启用调试模式？'
+        )
+        msg.setInformativeText(
+            '系统将自动添加参数 --remote-debugging-port=9222 并重新启动该进程。\n'
+            '重启后请等待软件完全加载，再点击「一键检测并扫描」。'
+        )
+        msg.setIcon(QMessageBox.Icon.Information)
+        # 创建具有明确说明的按钮
+        restart_btn = msg.addButton('重启并启用调试', QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        if msg.clickedButton() == restart_btn:
+            self._do_restart_with_debug_port(sp)
+
+    def _do_restart_with_debug_port(self, sp):
+        """
+        启动后台线程重启进程并附加调试端口参数（默认端口 9222）。
+        重启过程不阻塞 UI。
+        """
+        if self._restart_worker and self._restart_worker.isRunning():
+            return  # 已在重启中，防止重复触发
+
+        self._connect_btn.setEnabled(False)
+        self._one_click_btn.setEnabled(False)
+        self._status_lbl.setText(f'正在重启进程 {sp.name}，请稍候...')
+
+        self._restart_worker = _RestartWorker(sp.pid, port=9222)
+        self._restart_worker.finished.connect(self._on_restart_finished)
+        self._restart_worker.start()
+
+    def _on_restart_finished(self, success: bool, msg: str):
+        """进程重启完成后的回调：更新 UI 状态并提示用户"""
+        self._connect_btn.setEnabled(True)
+        self._one_click_btn.setEnabled(True)
+        if success:
+            # 重启成功：预填调试端口，提示用户稍等后再扫描
+            self._port_input.setText('9222')
+            self._status_lbl.setText(msg)
+            InfoBar.success(
+                title='重启成功',
+                content=msg,
+                duration=6000,
+                position=InfoBarPosition.TOP,
+                parent=self,
+            )
+        else:
+            self._status_lbl.setText('重启失败，请查看错误提示')
+            InfoBar.error(
+                title='重启失败',
+                content=msg,
+                duration=5000,
+                position=InfoBarPosition.TOP,
+                parent=self,
+            )
+
 
     def _refresh_page_list(self, port: int):
         """刷新左侧页面列表"""
@@ -443,8 +651,9 @@ class DetectPage(QWidget):
 
     # ──────────── 扫描结果回调 ─────────────────────────────────────────────
     def _on_scan_finished(self, data: dict):
-        """CDP 扫描完成：填充所有 Tab"""
+        """CDP 扫描完成：填充所有 Tab，并重新启用按钮"""
         self._connect_btn.setEnabled(True)
+        self._one_click_btn.setEnabled(True)
         self._last_data = data
         if data.get('error'):
             self._status_lbl.setText(f'扫描失败: {data["error"]}')
@@ -474,8 +683,9 @@ class DetectPage(QWidget):
         )
 
     def _on_scan_error(self, msg: str):
-        """扫描出错"""
+        """扫描出错：重新启用按钮并显示错误提示"""
         self._connect_btn.setEnabled(True)
+        self._one_click_btn.setEnabled(True)
         self._status_lbl.setText(f'错误: {msg}')
         InfoBar.error(
             title='扫描出错',
