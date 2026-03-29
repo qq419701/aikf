@@ -111,7 +111,7 @@ def read_sqlite_safe(db_path: str, table_hint: str = None, limit: int = 200) -> 
     try:
         conn = sqlite3.connect(tmp_path, timeout=3)
         result = _read_conn(conn)
-        result['__source__'] = '临时副本（原文件已锁定）'
+        result['_read_method'] = '临时副本（原文件已锁定）'
         return result
     except Exception as e2:
         return {'error': f'临时副本读取也失败: {e2}（原始错误: {first_error}）', 'locked': True}
@@ -180,11 +180,12 @@ def extract_chat_messages(data_dirs: list) -> list:
                 if depth > 8:
                     dirs.clear()
                     continue
-                # 优先搜索聊天相关子目录（将其排序到前面）
-                dirs.sort(key=lambda x: (
-                    0 if any(kw in x.lower() for kw in priority_dir_keywords) else 1,
-                    x,
-                ))
+                # 仅在浅层（前3级）对子目录排序，优先进入聊天相关目录
+                if depth <= 3:
+                    dirs.sort(key=lambda x: (
+                        0 if any(kw in x.lower() for kw in priority_dir_keywords) else 1,
+                        x,
+                    ))
                 for fname in files:
                     fname_lower = fname.lower()
                     fpath = os.path.join(root, fname)

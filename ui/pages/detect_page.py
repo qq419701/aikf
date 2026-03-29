@@ -671,17 +671,19 @@ class DetectPage(QWidget):
         self._one_click_btn.setEnabled(False)
         self._status_lbl.setText(f'正在重启进程 {sp.name}，请稍候...')
 
-        self._restart_worker = _RestartWorker(sp.pid, port=9222)
+        self._restart_debug_port = 9222
+        self._restart_worker = _RestartWorker(sp.pid, port=self._restart_debug_port)
         self._restart_worker.finished.connect(self._on_restart_finished)
         self._restart_worker.start()
 
     def _on_restart_finished(self, success: bool, msg: str):
         """进程重启完成后的回调：更新 UI 状态并提示用户"""
+        debug_port = getattr(self, '_restart_debug_port', 9222)
         self._connect_btn.setEnabled(True)
         self._one_click_btn.setEnabled(True)
         if success:
             # 重启成功：预填调试端口，提示用户稍等后再扫描
-            self._port_input.setText('9222')
+            self._port_input.setText(str(debug_port))
             self._status_lbl.setText(msg)
             self._log(msg, 'ok')
             self._log('请等待软件完全加载后，再点击「一键检测并扫描」', 'info')
@@ -696,8 +698,8 @@ class DetectPage(QWidget):
             self._status_lbl.setText('重启失败，请查看日志')
             self._log(f'重启失败: {msg}', 'error')
             self._log(
-                '建议：请手动关闭软件，然后以管理员身份在命令行添加'
-                ' --remote-debugging-port=9222 参数重新启动', 'warn'
+                f'建议：请手动关闭软件，然后以管理员身份在命令行添加'
+                f' --remote-debugging-port={debug_port} 参数重新启动', 'warn'
             )
             InfoBar.error(
                 title='重启失败',
