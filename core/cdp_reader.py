@@ -135,6 +135,59 @@ def get_pages(debug_port: int) -> list:
         return []
 
 
+def check_debug_port(debug_port: int) -> dict:
+    """
+    检测调试端口是否可用，返回详细状态字典。
+
+    返回:
+        {
+            'ok': bool,           # True 表示可用
+            'pages': list,        # 可用页面列表（ok=True 时有值）
+            'error': str,         # 错误描述（ok=False 时有值）
+            'suggestion': str,    # 操作建议（ok=False 时有值）
+        }
+    """
+    result = {'ok': False, 'pages': [], 'error': '', 'suggestion': ''}
+    if not debug_port:
+        result['error'] = '未指定调试端口'
+        result['suggestion'] = (
+            '请先为目标进程添加 --remote-debugging-port=9222 参数并重启，'
+            '或在「高级」输入框手动填写已知的调试端口号。'
+        )
+        return result
+    try:
+        resp = requests.get(f'http://localhost:{debug_port}/json', timeout=3)
+        pages = resp.json()
+        usable = [p for p in pages if isinstance(p, dict) and 'webSocketDebuggerUrl' in p]
+        if usable:
+            result['ok'] = True
+            result['pages'] = usable
+        else:
+            result['error'] = f'端口 {debug_port} 已响应，但没有可用的调试页面'
+            result['suggestion'] = (
+                '目标软件可能尚未完全加载，请等待主界面出现后再扫描；'
+                '也可以尝试在软件中打开一个新页面。'
+            )
+    except requests.exceptions.ConnectionError:
+        result['error'] = f'无法连接到调试端口 {debug_port}（Connection refused）'
+        result['suggestion'] = (
+            f'进程未以调试模式启动。请关闭当前进程，然后用以下方式重新启动：\n'
+            f'在命令行添加参数 --remote-debugging-port={debug_port}\n'
+            f'（例如：PddWorkbench.exe --remote-debugging-port={debug_port}）\n'
+            f'或直接点击「重启并启用调试」按钮自动完成。'
+        )
+    except requests.exceptions.Timeout:
+        result['error'] = f'连接调试端口 {debug_port} 超时'
+        result['suggestion'] = (
+            '软件可能正在启动或响应慢，请等待几秒后再试。'
+            '如果持续超时，请检查防火墙或安全软件是否拦截了本地端口。'
+        )
+    except Exception as e:
+        result['error'] = f'检测端口 {debug_port} 时出错: {e}'
+        result['suggestion'] = '请确认端口号正确，并确保目标软件正在运行。'
+    return result
+
+
 def extract_cookies_via_cdp(client: CdpClient) -> list:
     """
     通过CDP Network.getAllCookies获取所有Cookie
@@ -280,12 +333,15 @@ def scan_all_pages(debug_port: int) -> dict:
         'all_cookies': [],
         'scan_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'error': '',
+        'suggestion': '',
     }
     try:
-        pages = get_pages(debug_port)
-        if not pages:
-            summary['error'] = f'无法连接到调试端口 {debug_port}，或没有可用页面'
+        check = check_debug_port(debug_port)
+        if not check['ok']:
+            summary['error'] = check['error']
+            summary['suggestion'] = check['suggestion']
             return summary
+        pages = check['pages']
         seen_cookie_keys = set()
         for page in pages:
             page_result = {

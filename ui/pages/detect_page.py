@@ -311,6 +311,30 @@ class DetectPage(QWidget):
         splitter.setSizes([260, 900])
         root.addWidget(splitter, 1)
 
+        # ── 底部日志面板 ──
+        log_header = QHBoxLayout()
+        log_title = QLabel('📋 运行日志')
+        log_title.setStyleSheet('font-size: 11px; font-weight: bold; color: #555;')
+        log_header.addWidget(log_title)
+        log_header.addStretch()
+        clear_log_btn = PushButton('清空日志')
+        clear_log_btn.setFixedHeight(22)
+        clear_log_btn.setStyleSheet('font-size: 11px;')
+        clear_log_btn.clicked.connect(self._on_clear_log)
+        log_header.addWidget(clear_log_btn)
+        root.addLayout(log_header)
+        self._log_box = QPlainTextEdit()
+        self._log_box.setReadOnly(True)
+        self._log_box.setMaximumHeight(120)
+        self._log_box.setPlaceholderText('操作日志将在这里显示，方便排查问题…')
+        log_font = QFont('Consolas', 9)
+        log_font.setStyleHint(QFont.StyleHint.Monospace)
+        self._log_box.setFont(log_font)
+        self._log_box.setStyleSheet(
+            'background: #1e1e1e; color: #d4d4d4; border: 1px solid #444; border-radius: 4px;'
+        )
+        root.addWidget(self._log_box)
+
     # ──────────── Tab 构建 ─────────────────────────────────────────────────
     def _setup_tab_chat(self):
         """构建聊天消息 Tab"""
@@ -393,6 +417,27 @@ class DetectPage(QWidget):
         except Exception:
             pass
 
+    # ──────────── 日志面板 ─────────────────────────────────────────────────
+    def _log(self, msg: str, level: str = 'info'):
+        """向底部日志面板追加一行日志（level: info / warn / error / ok）"""
+        try:
+            ts = datetime.now().strftime('%H:%M:%S')
+            icons = {'info': 'ℹ', 'warn': '⚠', 'error': '✗', 'ok': '✔'}
+            icon = icons.get(level, 'ℹ')
+            self._log_box.appendPlainText(f'[{ts}] {icon} {msg}')
+            self._log_box.verticalScrollBar().setValue(
+                self._log_box.verticalScrollBar().maximum()
+            )
+        except Exception:
+            pass
+
+    def _on_clear_log(self):
+        """清空日志面板"""
+        try:
+            self._log_box.clear()
+        except Exception:
+            pass
+
     # ──────────── 进程下拉框管理 ───────────────────────────────────────────
     def _make_combo_text(self, sp) -> str:
         """生成下拉框显示文本"""
@@ -409,6 +454,12 @@ class DetectPage(QWidget):
             self._proc_combo.addItem(text, userData=sp.pid)
             if getattr(sp, 'debug_port', 0):
                 self._port_input.setText(str(sp.debug_port))
+                self._log(f'检测到进程 {sp.name} (PID:{sp.pid})，调试端口: {sp.debug_port}', 'ok')
+            else:
+                self._log(
+                    f'检测到进程 {sp.name} (PID:{sp.pid})，暂无调试端口'
+                    '（点击「一键检测并扫描」可自动处理）', 'info'
+                )
         except Exception:
             pass
 
@@ -425,7 +476,7 @@ class DetectPage(QWidget):
     def _on_proc_changed(self, index: int):
         """
         切换进程时的处理：
-        - 如果进程有调试端口，自动填入端口号
+        - 如果进程有调试端口，自动填入端口号并记录日志
         - 如果进程没有调试端口（debug_port == 0），延迟弹出提示对话框
         """
         try:
@@ -440,9 +491,17 @@ class DetectPage(QWidget):
                     if getattr(sp, 'debug_port', 0):
                         # 有调试端口：自动填入，可直接点击扫描
                         self._port_input.setText(str(sp.debug_port))
+                        self._log(
+                            f'已选择 {sp.name}，调试端口 {sp.debug_port} 已自动填入，'
+                            '可直接点击「一键检测并扫描」', 'ok'
+                        )
                     else:
                         # 无调试端口：保存进程信息，延迟弹出提示（避免在信号中直接弹窗）
                         self._pending_no_debug_sp = sp
+                        self._log(
+                            f'已选择 {sp.name} (PID:{sp.pid})，该进程尚未开启调试模式，'
+                            '点击「一键检测并扫描」将提示自动重启', 'warn'
+                        )
                         QTimer.singleShot(_DIALOG_DELAY_MS, self._show_no_debug_port_dialog)
                     break
         except Exception:
@@ -490,16 +549,9 @@ class DetectPage(QWidget):
                 parent=self,
             )
             return
-        self._connect_btn.setEnabled(False)
-        self._one_click_btn.setEnabled(False)
-        self._status_lbl.setText(f'正在连接端口 {port}，扫描所有页面...')
-        self._refresh_page_list(port)
-        if self._scan_worker and self._scan_worker.isRunning():
-            self._scan_worker.quit()
-        self._scan_worker = _CdpScanWorker(port)
-        self._scan_worker.finished.connect(self._on_scan_finished)
-        self._scan_worker.error.connect(self._on_scan_error)
-        self._scan_worker.start()
+        self._log(f'[手动连接] 准备连接端口 {port}…')
+        self._do_connect_scan(port)
+
 
     # ──────────── 一键检测并扫描 ──────────────────────────────────────────
     def _on_one_click_detect(self):
@@ -541,10 +593,34 @@ class DetectPage(QWidget):
             )
 
     def _do_connect_scan(self, port: int):
-        """实际执行 CDP 连接和扫描的内部方法"""
+        """实际执行 CDP 连接和扫描的内部方法（先验证端口可用性）"""
         self._connect_btn.setEnabled(False)
         self._one_click_btn.setEnabled(False)
-        self._status_lbl.setText(f'正在连接端口 {port}，扫描所有页面...')
+        self._log(f'正在检测调试端口 {port} 可用性…')
+        self._status_lbl.setText(f'正在验证端口 {port}…')
+
+        # 先做一次快速端口检测，给用户即时反馈
+        check = cdp_reader.check_debug_port(port)
+        if not check['ok']:
+            self._connect_btn.setEnabled(True)
+            self._one_click_btn.setEnabled(True)
+            self._status_lbl.setText('端口不可用，请查看日志')
+            self._log(f'端口 {port} 检测失败: {check["error"]}', 'error')
+            if check.get('suggestion'):
+                self._log(f'建议: {check["suggestion"]}', 'warn')
+            InfoBar.error(
+                title='无法连接',
+                content=check['error'],
+                duration=6000,
+                position=InfoBarPosition.TOP,
+                parent=self,
+            )
+            return
+
+        self._log(
+            f'端口 {port} 可用，发现 {len(check["pages"])} 个页面，开始扫描…', 'ok'
+        )
+        self._status_lbl.setText(f'正在连接端口 {port}，扫描所有页面…')
         self._refresh_page_list(port)
         if self._scan_worker and self._scan_worker.isRunning():
             self._scan_worker.quit()
@@ -607,6 +683,8 @@ class DetectPage(QWidget):
             # 重启成功：预填调试端口，提示用户稍等后再扫描
             self._port_input.setText('9222')
             self._status_lbl.setText(msg)
+            self._log(msg, 'ok')
+            self._log('请等待软件完全加载后，再点击「一键检测并扫描」', 'info')
             InfoBar.success(
                 title='重启成功',
                 content=msg,
@@ -615,7 +693,12 @@ class DetectPage(QWidget):
                 parent=self,
             )
         else:
-            self._status_lbl.setText('重启失败，请查看错误提示')
+            self._status_lbl.setText('重启失败，请查看日志')
+            self._log(f'重启失败: {msg}', 'error')
+            self._log(
+                '建议：请手动关闭软件，然后以管理员身份在命令行添加'
+                ' --remote-debugging-port=9222 参数重新启动', 'warn'
+            )
             InfoBar.error(
                 title='重启失败',
                 content=msg,
@@ -656,11 +739,16 @@ class DetectPage(QWidget):
         self._one_click_btn.setEnabled(True)
         self._last_data = data
         if data.get('error'):
-            self._status_lbl.setText(f'扫描失败: {data["error"]}')
+            err_msg = data['error']
+            suggestion = data.get('suggestion', '')
+            self._status_lbl.setText(f'扫描失败: {err_msg}')
+            self._log(f'扫描失败: {err_msg}', 'error')
+            if suggestion:
+                self._log(f'建议: {suggestion}', 'warn')
             InfoBar.error(
                 title='扫描失败',
-                content=data['error'],
-                duration=5000,
+                content=err_msg,
+                duration=6000,
                 position=InfoBarPosition.TOP,
                 parent=self,
             )
@@ -671,6 +759,17 @@ class DetectPage(QWidget):
         self._status_lbl.setText(
             f'扫描完成 | 页面: {len(pages)} | 总Cookie: {total_ck} | {scan_time}'
         )
+        self._log(
+            f'扫描完成：共 {len(pages)} 个页面，{total_ck} 条 Cookie，耗时见右上角时间', 'ok'
+        )
+        for i, pg in enumerate(pages):
+            title = pg.get('title', '') or pg.get('url', '')
+            pg_data = pg.get('data', {})
+            chat_cnt = len(pg_data.get('chat_messages', []))
+            ck_cnt = len(pg_data.get('cookies', []))
+            self._log(
+                f'  页面[{i+1}] {title[:50]} — 聊天:{chat_cnt} 条, Cookie:{ck_cnt} 条'
+            )
         if pages:
             self._page_list.setCurrentRow(0)
             self._populate_tabs(pages[0].get('data', {}))
@@ -687,6 +786,7 @@ class DetectPage(QWidget):
         self._connect_btn.setEnabled(True)
         self._one_click_btn.setEnabled(True)
         self._status_lbl.setText(f'错误: {msg}')
+        self._log(f'扫描线程异常: {msg}', 'error')
         InfoBar.error(
             title='扫描出错',
             content=msg,
