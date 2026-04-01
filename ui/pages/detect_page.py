@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 
 import psutil
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -161,11 +161,6 @@ def _item(text: str, color: str = None) -> QTableWidgetItem:
     if color:
         it.setForeground(QColor(color))
     return it
-
-# 弹出无调试端口提示对话框的延迟（毫秒）
-# 延迟是为了避免在 currentIndexChanged 信号处理函数中直接弹出对话框，
-# 防止 Qt 在信号栈仍在运行时处理模态窗口事件循环导致的异常。
-_DIALOG_DELAY_MS = 300
 
 
 # ─────────────────────── CDP 检测页面主体 ──────────────────────────────────
@@ -424,9 +419,9 @@ class DetectPage(QWidget):
 
     def _on_proc_changed(self, index: int):
         """
-        切换进程时的处理：
-        - 如果进程有调试端口，自动填入端口号
-        - 如果进程没有调试端口（debug_port == 0），延迟弹出提示对话框
+        切换进程时静默更新端口输入框。
+        若进程有调试端口，自动填入；否则不做任何操作。
+        弹窗逻辑仅在用户点击「一键检测并扫描」时触发。
         """
         try:
             if not self._watcher or index < 0:
@@ -438,12 +433,8 @@ class DetectPage(QWidget):
             for sp in procs:
                 if sp.pid == pid:
                     if getattr(sp, 'debug_port', 0):
-                        # 有调试端口：自动填入，可直接点击扫描
                         self._port_input.setText(str(sp.debug_port))
-                    else:
-                        # 无调试端口：保存进程信息，延迟弹出提示（避免在信号中直接弹窗）
-                        self._pending_no_debug_sp = sp
-                        QTimer.singleShot(_DIALOG_DELAY_MS, self._show_no_debug_port_dialog)
+                    # 没有调试端口时不弹窗，等用户主动点击「一键检测并扫描」即可
                     break
         except Exception:
             pass
