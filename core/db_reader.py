@@ -6,8 +6,53 @@
 """
 
 import os
+import shutil
 import sqlite3
+import tempfile
 from datetime import datetime
+
+
+# SQLite 文件魔数（前 16 字节的前 6 字节）
+_SQLITE_MAGIC = b'SQLite'
+
+
+def _is_sqlite_file(path: str) -> bool:
+    """快速判断文件是否为 SQLite 数据库（读取魔数头）"""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(16)
+        return header[:6] == _SQLITE_MAGIC
+    except Exception:
+        return False
+
+
+def _copy_db_to_temp(db_path: str) -> str:
+    """
+    将 SQLite 数据库文件（含 WAL/SHM 辅助文件）复制到临时目录，
+    返回临时副本路径。调用方负责在使用完毕后删除临时目录。
+
+    同时复制 .db-wal 和 .db-shm 文件（如果存在），确保 WAL 模式下
+    读取的数据尽量完整，并规避原文件被其他进程独占锁定的问题。
+
+    参数:
+        db_path (str): 原始数据库文件路径
+
+    返回:
+        str: 临时副本文件路径，失败时返回空字符串
+    """
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix='aikf_db_')
+        fname = os.path.basename(db_path)
+        tmp_path = os.path.join(tmp_dir, fname)
+        shutil.copy2(db_path, tmp_path)
+        # 同步复制 WAL / SHM 辅助文件（WAL 模式必须同时拷贝才能读到未检查点的数据）
+        for suffix in ('-wal', '-shm'):
+            aux = db_path + suffix
+            if os.path.isfile(aux):
+                shutil.copy2(aux, tmp_path + suffix)
+        return tmp_path
+    except Exception:
+        return ''
 
 
 def read_sqlite_safe(db_path: str, table_hint: str = None, limit: int = 200) -> dict:
@@ -16,25 +61,26 @@ def read_sqlite_safe(db_path: str, table_hint: str = None, limit: int = 200) -> 
     如果提供 table_hint，则只读取表名包含该关键词的表。
     捕获所有异常，失败返回 {'error': str}。
 
+    策略：
+    1. 优先尝试 file:?mode=ro URI 方式（无副作用，适合未被锁定的文件）。
+    2. 若出现数据库锁定错误（database is locked / unable to open），
+       自动将文件复制到临时目录再打开（规避进程独占锁）。
+
     参数:
         db_path (str): SQLite 文件路径
         table_hint (str): 可选，只读取包含此关键词的表（不区分大小写）
         limit (int): 每张表最多读取的行数，默认 200
 
     返回:
-        dict: {表名: [行字典, ...]}，失败时返回 {'error': '错误信息'}
+        dict: {表名: [行字典, ...]}，失败时返回 {'error': '错误信息', 'locked': bool}
     """
-    result = {}
-    try:
-        # 以只读 URI 模式打开，避免意外写入
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=3)
+    def _read_conn(conn) -> dict:
+        result = {}
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        # 列出所有普通表
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [r[0] for r in cursor.fetchall()]
         for table in tables:
-            # 如果指定了表名过滤关键词，跳过不匹配的表
             if table_hint and table_hint.lower() not in table.lower():
                 continue
             try:
@@ -44,9 +90,36 @@ def read_sqlite_safe(db_path: str, table_hint: str = None, limit: int = 200) -> 
             except Exception as table_err:
                 result[table] = [{'__read_error__': str(table_err)}]
         conn.close()
+        return result
+
+    # 第一次尝试：只读 URI 模式
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=3)
+        return _read_conn(conn)
     except Exception as e:
-        return {'error': str(e)}
-    return result
+        first_error = str(e)
+        # 如果是锁定/无法打开错误，回退到临时副本策略
+        locked_keywords = ('locked', 'unable to open', 'disk i/o error', 'readonly')
+        if not any(kw in first_error.lower() for kw in locked_keywords):
+            return {'error': first_error, 'locked': False}
+
+    # 第二次尝试：复制到临时目录后打开
+    tmp_path = _copy_db_to_temp(db_path)
+    if not tmp_path:
+        return {'error': f'数据库已锁定且无法创建临时副本: {first_error}', 'locked': True}
+    tmp_dir = os.path.dirname(tmp_path)
+    try:
+        conn = sqlite3.connect(tmp_path, timeout=3)
+        result = _read_conn(conn)
+        result['_read_method'] = '临时副本（原文件已锁定）'
+        return result
+    except Exception as e2:
+        return {'error': f'临时副本读取也失败: {e2}（原始错误: {first_error}）', 'locked': True}
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def extract_chat_messages(data_dirs: list) -> list:
@@ -61,8 +134,44 @@ def extract_chat_messages(data_dirs: list) -> list:
         list[dict]: [{'db_path': str, 'table': str, 'row': dict}, ...]
     """
     messages = []
-    # 目标文件名（小写匹配）
-    target_names = {'msg.db', 'chat.db', 'message.db'}
+    # 目标文件名（小写匹配）——包含 WBChat / Xiaoer 常用聊天库文件名
+    target_names = {
+        'msg.db', 'chat.db', 'message.db',
+        'wbchat.db', 'xiaoer.db', 'im.db', 'session.db',
+    }
+    # 优先搜索的聊天相关子目录（名称含这些关键词则优先进入）
+    priority_dir_keywords = {'wbchat', 'xiaoer', 'chat', 'msg', 'im', 'session'}
+
+    def _process_db(db_path: str):
+        """读取单个 db 文件并追加结果"""
+        try:
+            tables_data = read_sqlite_safe(db_path)
+            if 'error' in tables_data:
+                messages.append({
+                    'db_path': db_path,
+                    'table': '__error__',
+                    'row': {
+                        'error': tables_data['error'],
+                        'locked': tables_data.get('locked', False),
+                    },
+                })
+                return
+            for table_name, rows in tables_data.items():
+                if table_name.startswith('__'):
+                    continue
+                for row in rows:
+                    messages.append({
+                        'db_path': db_path,
+                        'table': table_name,
+                        'row': row,
+                    })
+        except Exception as e:
+            messages.append({
+                'db_path': db_path,
+                'table': '__error__',
+                'row': {'error': str(e)},
+            })
+
     for d in data_dirs:
         try:
             for root, dirs, files in os.walk(d, followlinks=False):
@@ -71,32 +180,25 @@ def extract_chat_messages(data_dirs: list) -> list:
                 if depth > 8:
                     dirs.clear()
                     continue
+                # 仅在浅层（前3级）对子目录排序，优先进入聊天相关目录
+                if depth <= 3:
+                    dirs.sort(key=lambda x: (
+                        0 if any(kw in x.lower() for kw in priority_dir_keywords) else 1,
+                        x,
+                    ))
                 for fname in files:
-                    if fname.lower() in target_names:
-                        db_path = os.path.join(root, fname)
-                        try:
-                            tables_data = read_sqlite_safe(db_path)
-                            if 'error' in tables_data:
-                                # 记录读取失败信息
-                                messages.append({
-                                    'db_path': db_path,
-                                    'table': '__error__',
-                                    'row': {'error': tables_data['error']},
-                                })
-                                continue
-                            for table_name, rows in tables_data.items():
-                                for row in rows:
-                                    messages.append({
-                                        'db_path': db_path,
-                                        'table': table_name,
-                                        'row': row,
-                                    })
-                        except Exception as e:
-                            messages.append({
-                                'db_path': db_path,
-                                'table': '__error__',
-                                'row': {'error': str(e)},
-                            })
+                    fname_lower = fname.lower()
+                    fpath = os.path.join(root, fname)
+                    # 1. 名称匹配
+                    if fname_lower in target_names:
+                        _process_db(fpath)
+                        continue
+                    # 2. WBChat / Xiaoer 目录下无扩展名文件（可能是 SQLite）
+                    dir_lower = root.lower()
+                    if (not os.path.splitext(fname)[1]
+                            and any(kw in dir_lower for kw in ('wbchat', 'xiaoer'))
+                            and _is_sqlite_file(fpath)):
+                        _process_db(fpath)
         except Exception:
             pass
     return messages
@@ -116,7 +218,7 @@ def extract_order_info(data_dirs: list) -> list:
     """
     orders = []
     # 目标文件名（小写匹配）
-    target_names = {'info2.db', 'info.db', 'order.db', 'search.db'}
+    target_names = {'info2.db', 'info.db', 'order.db', 'search.db', 'footprint.db', 'trace.db'}
     for d in data_dirs:
         try:
             for root, dirs, files in os.walk(d, followlinks=False):
@@ -133,10 +235,15 @@ def extract_order_info(data_dirs: list) -> list:
                                 orders.append({
                                     'db_path': db_path,
                                     'table': '__error__',
-                                    'row': {'error': tables_data['error']},
+                                    'row': {
+                                        'error': tables_data['error'],
+                                        'locked': tables_data.get('locked', False),
+                                    },
                                 })
                                 continue
                             for table_name, rows in tables_data.items():
+                                if table_name.startswith('__'):
+                                    continue
                                 for row in rows:
                                     orders.append({
                                         'db_path': db_path,
@@ -168,10 +275,8 @@ def extract_cookies(cookie_paths: list) -> list:
     """
     cookies = []
     for cookie_path in cookie_paths:
-        try:
-            conn = sqlite3.connect(f'file:{cookie_path}?mode=ro', uri=True, timeout=3)
+        def _read_cookies_from_conn(conn, src_path):
             cursor = conn.cursor()
-            # Chromium Cookies 表结构
             try:
                 cursor.execute(
                     'SELECT host_key, name, value, path, expires_utc FROM cookies LIMIT 2000'
@@ -184,7 +289,7 @@ def extract_cookies(cookie_paths: list) -> list:
                         'value': r[2] or '',
                         'path': r[3] or '',
                         'expires_utc': r[4] or 0,
-                        '_source': cookie_path,
+                        '_source': src_path,
                     })
             except Exception as inner_e:
                 # 尝试枚举所有表查找 cookies 相关表
@@ -195,7 +300,7 @@ def extract_cookies(cookie_paths: list) -> list:
                         'host': '',
                         'name': '__info__',
                         'value': f'可用表: {tables}',
-                        'path': cookie_path,
+                        'path': src_path,
                         'expires_utc': 0,
                         '_error': str(inner_e),
                     })
@@ -204,18 +309,50 @@ def extract_cookies(cookie_paths: list) -> list:
                         'host': '',
                         'name': '__error__',
                         'value': str(inner_e),
-                        'path': cookie_path,
+                        'path': src_path,
                         'expires_utc': 0,
                     })
             conn.close()
+
+        # 第一次尝试：只读 URI 模式
+        try:
+            conn = sqlite3.connect(f'file:{cookie_path}?mode=ro', uri=True, timeout=3)
+            _read_cookies_from_conn(conn, cookie_path)
         except Exception as e:
-            cookies.append({
-                'host': '',
-                'name': '__error__',
-                'value': str(e),
-                'path': cookie_path,
-                'expires_utc': 0,
-            })
+            first_err = str(e)
+            locked_kws = ('locked', 'unable to open', 'disk i/o error', 'readonly')
+            if any(kw in first_err.lower() for kw in locked_kws):
+                # 尝试临时副本
+                tmp_path = _copy_db_to_temp(cookie_path)
+                tmp_dir = os.path.dirname(tmp_path) if tmp_path else None
+                try:
+                    if tmp_path:
+                        conn2 = sqlite3.connect(tmp_path, timeout=3)
+                        _read_cookies_from_conn(conn2, cookie_path)
+                    else:
+                        cookies.append({
+                            'host': '', 'name': '__error__',
+                            'value': f'锁定且无法创建副本: {first_err}',
+                            'path': cookie_path, 'expires_utc': 0,
+                        })
+                except Exception as e2:
+                    cookies.append({
+                        'host': '', 'name': '__error__',
+                        'value': str(e2),
+                        'path': cookie_path, 'expires_utc': 0,
+                    })
+                finally:
+                    if tmp_dir:
+                        try:
+                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+            else:
+                cookies.append({
+                    'host': '', 'name': '__error__',
+                    'value': first_err,
+                    'path': cookie_path, 'expires_utc': 0,
+                })
     return cookies
 
 

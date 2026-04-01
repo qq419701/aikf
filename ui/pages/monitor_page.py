@@ -84,7 +84,7 @@ class ProcessCard(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(3)
 
-        # 第一行：状态灯 + 平台名 + 进程名
+        # 第一行：状态灯 + 平台名 + 进程名 + 调试端口徽章
         row1 = QHBoxLayout()
         row1.setSpacing(6)
         status = getattr(self.sp, 'status', '')
@@ -99,6 +99,22 @@ class ProcessCard(QFrame):
         name_label.setStyleSheet('font-weight: bold; font-size: 13px; color: #1a1a1a;')
         row1.addWidget(name_label)
         row1.addStretch()
+
+        # 调试端口徽章：绿色=已开启，橙色=未开启
+        debug_port = getattr(self.sp, 'debug_port', 0)
+        if debug_port:
+            badge = QLabel(f'CDP:{debug_port}')
+            badge.setStyleSheet(
+                'font-size: 10px; color: white; background: #00a550; '
+                'border-radius: 8px; padding: 1px 6px;'
+            )
+        else:
+            badge = QLabel('无调试')
+            badge.setStyleSheet(
+                'font-size: 10px; color: white; background: #e67e22; '
+                'border-radius: 8px; padding: 1px 6px;'
+            )
+        row1.addWidget(badge)
         layout.addLayout(row1)
 
         # 第二行：PID + 内存
@@ -431,18 +447,29 @@ class MonitorPage(QWidget):
             if window_titles:
                 self._detail_layout.addLayout(row('窗口标题', window_titles[0]))
 
+        # ── 调试端口状态（突出显示，帮助用户快速判断是否可用 CDP）──
+        debug_port = getattr(sp, 'debug_port', 0)
+        self._detail_layout.addWidget(section('CDP 调试端口'))
+        if debug_port:
+            dp_lbl = QLabel(f'✅ 已开启  端口: {debug_port}  → 可直接前往「数据检测」页面扫描')
+            dp_lbl.setStyleSheet('font-size: 12px; color: #00a550;')
+        else:
+            dp_lbl = QLabel(
+                '⚠️ 未开启  → 前往「数据检测」页面，点击「一键检测并扫描」可自动重启并开启'
+            )
+            dp_lbl.setStyleSheet('font-size: 12px; color: #e67e22;')
+        dp_lbl.setWordWrap(True)
+        self._detail_layout.addWidget(dp_lbl)
+
         # ── 网络连接 ──
         ws_connections = getattr(sp, 'ws_connections', []) or []
         tcp_count      = getattr(sp, 'tcp_count', 0)
-        debug_port     = getattr(sp, 'debug_port', 0)
         self._detail_layout.addWidget(section('网络连接'))
         self._detail_layout.addLayout(row('TCP连接数', str(tcp_count)))
         self._detail_layout.addLayout(
             row('WS候选连接', str(len(ws_connections)),
                 '#e74c3c' if ws_connections else '#333')
         )
-        if debug_port:
-            self._detail_layout.addLayout(row('调试端口', str(debug_port), '#e74c3c'))
         for ws in ws_connections[:5]:
             if isinstance(ws, dict):
                 remote_ip   = ws.get('remote_ip', '')
@@ -456,8 +483,10 @@ class MonitorPage(QWidget):
                 row('', f'{remote_ip}:{remote_port}  [{ws_status}]', '#e74c3c')
             )
 
-        # ── 数据目录 ──
+        # ── 数据目录与文件锁状态 ──
         local_data_dirs = getattr(sp, 'local_data_dirs', []) or []
+        data_files      = getattr(sp, 'data_files', {}) or {}
+        db_files        = data_files.get('db_files', []) or []
         if local_data_dirs:
             self._detail_layout.addWidget(section('数据目录'))
             for d in local_data_dirs[:5]:
@@ -465,6 +494,27 @@ class MonitorPage(QWidget):
                 lbl.setStyleSheet('font-size: 11px; color: #0078d4;')
                 lbl.setWordWrap(True)
                 self._detail_layout.addWidget(lbl)
+
+        # 已知 .db 文件及其锁定状态
+        if db_files:
+            import os
+            self._detail_layout.addWidget(section(f'数据库文件 ({len(db_files)} 个)'))
+            for fpath in db_files[:8]:
+                wal = fpath + '-wal'
+                shm = fpath + '-shm'
+                locked_hint = ''
+                if os.path.isfile(wal) or os.path.isfile(shm):
+                    locked_hint = '  🔒 WAL锁'
+                lbl = QLabel(f'{os.path.basename(fpath)}{locked_hint}')
+                lbl.setToolTip(fpath)
+                color = '#e74c3c' if locked_hint else '#555'
+                lbl.setStyleSheet(f'font-size: 11px; color: {color};')
+                lbl.setWordWrap(True)
+                self._detail_layout.addWidget(lbl)
+            if len(db_files) > 8:
+                more = QLabel(f'…还有 {len(db_files) - 8} 个文件（深度扫描可查看全部）')
+                more.setStyleSheet('font-size: 11px; color: #aaa;')
+                self._detail_layout.addWidget(more)
 
         # ── 命令行 ──
         cmdline_str = getattr(sp, 'cmdline_str', '')
